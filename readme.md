@@ -9,3 +9,6 @@ DEFAULT_MODEL=mixtral-8x7b-32768
 VECTOR_DB_PATH=vector_db
 
 # The folder chroma_db will be created when you run the main.py file for the first time.
+
+--> Also, there will be some requirements you need to download as and when any error appears.
+--> This current version has only two students and teachers
