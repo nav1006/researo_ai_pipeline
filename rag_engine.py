@@ -1,201 +1,179 @@
-# rag_engine.py
 import os
-from typing import List, Dict
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_ollama import OllamaLLM
-from langchain_community.vectorstores import Chroma
-from config import config
+import json
+import chromadb
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
+import ollama
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+
+from config import Config
+from auth import decode_token
+
+config = Config()
+
+client = chromadb.PersistentClient(
+    path=config.CHROMA_DIR,
+    settings=Settings(anonymized_telemetry=False),
+)
+
+embedding_model = SentenceTransformer(config.EMBEDDING_MODEL)
+
+teacher_collection = client.get_or_create_collection(
+    name="teacher_docs",
+    metadata={"hnsw:space": "cosine"},
+)
+
+student_collection = client.get_or_create_collection(
+    name="student_docs",
+    metadata={"hnsw:space": "cosine"},
+)
 
 
-class RAGEngine:
-    def __init__(self):
-        """Initialize RAG engine with Ollama"""
-        print("Initializing RAG Engine...")
-        print("Loading embedding model (first run may take a minute)...")
+async def store_document(file_path: str, doc_id: str, access_level: str,
+                         allowed_student_ids: list, class_group: str | None = None):
+    if file_path.lower().endswith(".pdf"):
+        loader = PyPDFLoader(file_path)
+    else:
+        loader = TextLoader(file_path)
 
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=config.EMBEDDING_MODEL,
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
-        )
+    docs = loader.load()
 
-        print(f"Connecting to Ollama ({config.LLM_MODEL})...")
-        self.llm = OllamaLLM(
-            base_url=config.OLLAMA_BASE_URL,
-            model=config.LLM_MODEL,
-            temperature=0.7
-        )
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
 
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=config.CHUNK_SIZE,
-            chunk_overlap=config.CHUNK_OVERLAP
-        )
+    texts = [c.page_content for c in chunks]
+    embeddings = embedding_model.encode(texts).tolist()
 
-        self.teacher_vectorstore = None
-        self.student_vectorstore = None
+    json_allowed_ids = json.dumps(allowed_student_ids or [])
 
-    def load_documents_from_folder(self, folder_path: str) -> List:
-        """Load documents from folder"""
-        documents = []
-
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
-            return documents
-
-        for filename in os.listdir(folder_path):
-            file_path = os.path.join(folder_path, filename)
-
-            if not os.path.isfile(file_path):
-                continue
-
-            try:
-                if filename.endswith('.pdf'):
-                    loader = PyPDFLoader(file_path)
-                elif filename.endswith('.txt') or filename.endswith('.md'):
-                    loader = TextLoader(file_path)
-                elif filename.endswith('.docx'):
-                    loader = Docx2txtLoader(file_path)
-                else:
-                    continue
-
-                docs = loader.load()
-                for doc in docs:
-                    doc.metadata['source_file'] = filename
-                documents.extend(docs)
-                print(f"  ✓ {filename}")
-
-            except Exception as e:
-                print(f"  ✗ Error loading {filename}: {e}")
-
-        return documents
-
-    def index_documents(self):
-        """Index documents from folders"""
-        print("\nLoading teacher documents...")
-        teacher_docs = self.load_documents_from_folder(config.TEACHER_FOLDER)
-
-        print("\nLoading student documents...")
-        student_docs = self.load_documents_from_folder(config.STUDENT_FOLDER)
-
-        if teacher_docs:
-            teacher_chunks = self.text_splitter.split_documents(teacher_docs)
-            print(f"\nCreating embeddings for {len(teacher_chunks)} teacher chunks...")
-
-            self.teacher_vectorstore = Chroma.from_documents(
-                documents=teacher_chunks,
-                embedding=self.embeddings,
-                collection_name="teacher_docs",
-                persist_directory=f"{config.CHROMA_PERSIST_DIR}/teacher"
-            )
-
-        if student_docs:
-            student_chunks = self.text_splitter.split_documents(student_docs)
-            print(f"Creating embeddings for {len(student_chunks)} student chunks...")
-
-            self.student_vectorstore = Chroma.from_documents(
-                documents=student_chunks,
-                embedding=self.embeddings,
-                collection_name="student_docs",
-                persist_directory=f"{config.CHROMA_PERSIST_DIR}/student"
-            )
-
-    def load_existing_index(self):
-        """Load existing indices"""
-        try:
-            teacher_path = f"{config.CHROMA_PERSIST_DIR}/teacher"
-            if os.path.exists(teacher_path):
-                self.teacher_vectorstore = Chroma(
-                    collection_name="teacher_docs",
-                    embedding_function=self.embeddings,
-                    persist_directory=teacher_path
-                )
-        except:
-            pass
-
-        try:
-            student_path = f"{config.CHROMA_PERSIST_DIR}/student"
-            if os.path.exists(student_path):
-                self.student_vectorstore = Chroma(
-                    collection_name="student_docs",
-                    embedding_function=self.embeddings,
-                    persist_directory=student_path
-                )
-        except:
-            pass
-
-    def query(self, query: str, user_role: str) -> Dict:
-        """Query with role-based access control"""
-        vectorstores = []
-
-        if user_role == "teacher":
-            if self.teacher_vectorstore:
-                vectorstores.append(("teacher", self.teacher_vectorstore))
-            if self.student_vectorstore:
-                vectorstores.append(("student", self.student_vectorstore))
-        else:
-            if self.student_vectorstore:
-                vectorstores.append(("student", self.student_vectorstore))
-
-        if not vectorstores:
-            return {
-                "answer": "No documents available. Please index documents first.",
-                "sources": []
-            }
-
-        all_docs = []
-        for source_type, vectorstore in vectorstores:
-            docs = vectorstore.similarity_search(query, k=config.TOP_K_RESULTS)
-            for doc in docs:
-                doc.metadata['access_level'] = source_type
-            all_docs.extend(docs)
-
-        if not all_docs:
-            return {
-                "answer": "I couldn't find relevant information to answer your question.",
-                "sources": []
-            }
-
-        all_docs = all_docs[:config.TOP_K_RESULTS]
-
-        context = "\n\n".join([
-            f"[Document: {doc.metadata.get('source_file', 'Unknown')}]\n{doc.page_content}"
-            for doc in all_docs
-        ])
-
-        prompt = f"""You are a helpful AI assistant that answers questions based on provided context.
-
-INSTRUCTIONS:
-1. Read the context carefully
-2. Answer based ONLY on the context
-3. DO NOT quote directly - synthesize the information
-4. Use clear, professional language
-5. Format with paragraphs and bullet points
-6. If context is insufficient, say so
-
-CONTEXT:
-{context}
-
-QUESTION: {query}
-
-ANSWER:"""
-
-        response = self.llm.invoke(prompt)
-
-        sources = [
+    metadatas = []
+    for _ in chunks:
+        metadatas.append(
             {
-                "file": doc.metadata.get('source_file', 'Unknown'),
-                "access_level": doc.metadata.get('access_level', 'unknown')
+                "document_id": doc_id,
+                "access_level": access_level,
+                "allowed_student_ids": json_allowed_ids,
+                "class_group": class_group or "",
+                "filename": os.path.basename(file_path),
             }
-            for doc in all_docs
+        )
+
+    ids_teacher = [f"{doc_id}_t_{i}" for i in range(len(chunks))]
+    teacher_collection.add(
+        ids=ids_teacher,
+        embeddings=embeddings,
+        documents=texts,
+        metadatas=metadatas,
+    )
+
+    if access_level == "public":
+        ids_student = [f"{doc_id}_s_{i}" for i in range(len(chunks))]
+        student_collection.add(
+            ids=ids_student,
+            embeddings=embeddings,
+            documents=texts,
+            metadatas=metadatas,
+        )
+
+
+def build_rag_filter(user_token: str, user_id: str, user_classes: list) -> dict:
+    payload = decode_token(user_token)
+    if not payload:
+        return {}
+
+    user_role = payload.get("role")
+    if user_role in ["teacher", "admin"]:
+        return {}
+
+    return {
+        "or": [
+            {"key": "access_level", "match": {"value": "public"}},
+            # NOTE: Filtering on allowed_student_ids list is limited by Chroma capabilities
+            {
+                "and": [
+                    {"key": "access_level", "match": {"value": "specific_students"}},
+                ]
+            },
+            {
+                "and": [
+                    {"key": "access_level", "match": {"value": "class_group"}},
+                    {"key": "class_group", "in": user_classes}
+                ]
+            }
         ]
-
-        return {
-            "answer": response,
-            "sources": sources
-        }
+    }
 
 
-# Global instance
-rag_engine = RAGEngine()
+async def query_rag(query: str, user_token: str, user_id: str, user_classes: list = [], k: int = 5):
+    filter = build_rag_filter(user_token, user_id, user_classes)
+
+    query_embedding = embedding_model.encode([query]).tolist()
+
+    teacher_kwargs = {
+        "query_embeddings": query_embedding,
+        "n_results": k,
+    }
+    if filter:
+        teacher_kwargs["where"] = filter
+
+    teacher_results = teacher_collection.query(**teacher_kwargs)
+
+    payload = decode_token(user_token)
+    user_role = payload.get("role") if payload else "student"
+    if user_role == "student":
+        student_results = student_collection.query(
+            query_embeddings=query_embedding,
+            n_results=k,
+            where={"access_level": "public"},
+        )
+        if teacher_results["documents"] and teacher_results["documents"][0]:
+            teacher_results["documents"][0].extend(student_results["documents"][0])
+            teacher_results["metadatas"][0].extend(student_results["metadatas"][0])
+            teacher_results["distances"][0].extend(student_results["distances"][0])
+        else:
+            teacher_results = student_results
+
+    if (
+        not teacher_results
+        or not teacher_results["documents"]
+        or not teacher_results["documents"][0]
+    ):
+        return "Insufficient information provided.", []
+
+    chunks = teacher_results["documents"][0][:5]
+    context = "\n\n".join([f"Source {i}:\n{c}" for i, c in enumerate(chunks)])
+
+    system_prompt = """
+You are an expert educational assistant.
+
+Answer ONLY based on the following context extracted from documents.
+Do NOT quote verbatim, but synthesize information naturally into well-structured, clear, and concise paragraphs or bullet points.
+
+If the context is insufficient to answer, say 'Insufficient information provided.'
+"""
+
+    response = ollama.chat(
+        model=config.OLLAMA_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
+        ],
+    )
+
+    metadatas = teacher_results["metadatas"][0]
+    distances = teacher_results["distances"][0]
+
+    sources = []
+    for i, meta in enumerate(metadatas[:5]):
+        sources.append(
+            {
+                "document_id": meta.get("document_id"),
+                "filename": meta.get("filename"),
+                "access_level": meta.get("access_level"),
+                "score": 1 - distances[i],
+            }
+        )
+
+    return response["message"]["content"], sources

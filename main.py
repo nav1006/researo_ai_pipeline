@@ -1,171 +1,147 @@
-# main.py - Run this file in PyCharm!
-"""
-RAG System with Role-Based Access Control
-Interactive console version - No API server needed
-
-How to use:
-1. Add documents to documents/teacher/ and documents/student/
-2. Right-click this file → Run 'main'
-3. Follow the prompts in the Run window
-"""
-
 import os
-from rag_engine import rag_engine
+import uuid
+import json
+
+import uvicorn
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.staticfiles import StaticFiles
+
+from models import UserCreate, QueryRequest, UserRole
+from auth import hash_password, verify_password, create_access_token, decode_token
+from rag_engine import store_document, query_rag
+from config import Config
+
+config = Config()
+app = FastAPI(title="RAG RBAC Production - PyCharm")
+
+# In-memory stores for PoC
+users: dict[str, dict] = {}
+docs: dict[str, dict] = {}
+
+os.makedirs(config.UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=config.UPLOAD_DIR), name="uploads")
 
 
-def print_header():
-    """Print welcome header"""
-    print("\n" + "=" * 70)
-    print(" RAG SYSTEM WITH ROLE-BASED ACCESS CONTROL (OLLAMA)")
-    print("=" * 70)
-    print("\n✓ Using Ollama - 100% Local - No API Needed!")
-    print(f"✓ Model: {rag_engine.llm.model}")
-    print("=" * 70)
+@app.on_event("startup")
+async def startup():
+    # Create test users on startup to enable immediate logins
+    print("🚀 Starting RAG RBAC app...")
+
+    teacher_id = str(uuid.uuid4())
+    users[teacher_id] = {
+        "id": teacher_id,
+        "email": "teacher@test.com",
+        "password_hash": hash_password("pass123"),
+        "name": "Mr. Smith",
+        "role": UserRole.TEACHER.value,
+    }
+
+    student_id = str(uuid.uuid4())
+    users[student_id] = {
+        "id": student_id,
+        "email": "student@test.com",
+        "password_hash": hash_password("pass123"),
+        "name": "John Doe",
+        "role": UserRole.STUDENT.value,
+    }
+
+    print("\n🎯 TEST USERS READY:")
+    print("  Teacher: teacher@test.com / pass123")
+    print("  Student: student@test.com / pass123")
+    print("\nOpen Swagger UI at: http://127.0.0.1:8000/docs")
 
 
-def index_documents():
-    """Index documents"""
-    print("\n📚 INDEXING DOCUMENTS...")
-    print("-" * 70)
+@app.post("/auth/register")
+async def register(user_data: UserCreate):
+    if any(u["email"] == user_data.email for u in users.values()):
+        raise HTTPException(400, "User already exists")
 
-    choice = input("\nDo you want to index documents now? (y/n): ").lower()
+    user_id = str(uuid.uuid4())
+    users[user_id] = {
+        "id": user_id,
+        "email": user_data.email,
+        "password_hash": hash_password(user_data.password),
+        "name": user_data.name,
+        "role": user_data.role.value,
+    }
 
-    if choice == 'y':
-        rag_engine.index_documents()
-        print("\n✅ Indexing complete!")
-    else:
-        print("\n⏭️  Loading existing indices...")
-        rag_engine.load_existing_index()
-
-        if rag_engine.teacher_vectorstore or rag_engine.student_vectorstore:
-            print("✓ Loaded existing indices")
-        else:
-            print("⚠️  No indices found! Please index documents.")
+    token = create_access_token(user_id, user_data.role.value)
+    return {"access_token": token, "role": user_data.role}
 
 
-def query_loop():
-    """Main query loop"""
-    print("\n" + "=" * 70)
-    print(" QUERY INTERFACE")
-    print("=" * 70)
-
-    while True:
-        print("\n" + "-" * 70)
-        print("Select user role:")
-        print("  1. Teacher (access all documents)")
-        print("  2. Student (access only student documents)")
-        print("  3. Re-index documents")
-        print("  4. Exit")
-        print("-" * 70)
-
-        choice = input("\nEnter choice (1-4): ").strip()
-
-        if choice == '1':
-            role = 'teacher'
-            print("\n🎓 Logged in as: TEACHER (Full Access)")
-        elif choice == '2':
-            role = 'student'
-            print("\n👨‍🎓 Logged in as: STUDENT (Limited Access)")
-        elif choice == '3':
-            index_documents()
-            continue
-        elif choice == '4':
-            print("\n👋 Goodbye!")
-            print("=" * 70 + "\n")
-            break
-        else:
-            print("\n❌ Invalid choice.")
-            continue
-
-        # Query sub-loop
-        while True:
-            print("\n" + "-" * 70)
-            query = input("\n💭 Your question (or 'back' to change role, 'exit' to quit): ").strip()
-
-            if query.lower() == 'exit':
-                print("\n👋 Goodbye!")
-                print("=" * 70 + "\n")
-                return
-
-            if query.lower() == 'back':
+@app.post("/auth/login")
+async def login(email: str = Form(...), password: str = Form(...)):
+    for user_id, user in users.items():
+        if user["email"] == email:
+            if not verify_password(password, user["password_hash"]):
                 break
-
-            if not query:
-                print("⚠️  Please enter a question.")
-                continue
-
-            try:
-                print("\n🔍 Searching and generating answer...")
-                result = rag_engine.query(query, role)
-
-                print("\n" + "=" * 70)
-                print(" ANSWER")
-                print("=" * 70)
-                print(f"\n{result['answer']}")
-
-                if result['sources']:
-                    print("\n" + "-" * 70)
-                    print(" SOURCES")
-                    print("-" * 70)
-                    for i, source in enumerate(result['sources'], 1):
-                        print(f"  {i}. {source['file']} ({source['access_level']})")
-
-                print("\n" + "=" * 70)
-
-            except Exception as e:
-                print(f"\n❌ Error: {e}")
+            token = create_access_token(user_id, user["role"])
+            return {"access_token": token, "role": user["role"]}
+    raise HTTPException(401, "Invalid credentials")
 
 
-def check_setup():
-    """Check folders and documents"""
-    print("\n📋 CHECKING SETUP...")
-    print("-" * 70)
+@app.post("/documents/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    access_level: str = Form("public"),
+    allowed_student_ids: str = Form("[]"),
+    class_group: str = Form(""),
+    token: str = Form(...),
+):
+    payload = decode_token(token)
+    if not payload:
+        raise HTTPException(401, "Invalid or expired token")
 
-    teacher_folder = "./documents/teacher"
-    student_folder = "./documents/student"
+    role = payload.get("role")
+    uploader_id = payload.get("sub")
 
-    if not os.path.exists(teacher_folder):
-        os.makedirs(teacher_folder)
-        print(f"✓ Created: {teacher_folder}")
+    if role not in [UserRole.TEACHER.value, UserRole.ADMIN.value]:
+        raise HTTPException(403, "Only teachers/admins can upload")
 
-    if not os.path.exists(student_folder):
-        os.makedirs(student_folder)
-        print(f"✓ Created: {student_folder}")
+    os.makedirs(config.UPLOAD_DIR, exist_ok=True)
+    saved_path = os.path.join(config.UPLOAD_DIR, f"{uuid.uuid4()}_{file.filename}")
+    with open(saved_path, "wb") as f:
+        f.write(await file.read())
 
-    teacher_files = [f for f in os.listdir(teacher_folder)
-                     if os.path.isfile(os.path.join(teacher_folder, f))]
-    student_files = [f for f in os.listdir(student_folder)
-                     if os.path.isfile(os.path.join(student_folder, f))]
+    try:
+        allowed_ids = json.loads(allowed_student_ids) if allowed_student_ids else []
+    except json.JSONDecodeError:
+        raise HTTPException(400, "allowed_student_ids must be a JSON list")
 
-    print(f"\n📄 Documents found:")
-    print(f"   Teacher: {len(teacher_files)} files")
-    print(f"   Student: {len(student_files)} files")
+    doc_id = str(uuid.uuid4())
+    docs[doc_id] = {
+        "id": doc_id,
+        "filename": file.filename,
+        "file_path": saved_path,
+        "uploader_id": uploader_id,
+        "access_level": access_level,
+        "allowed_student_ids": allowed_ids,
+        "class_group": class_group,
+    }
 
-    if len(teacher_files) == 0 and len(student_files) == 0:
-        print("\n⚠️  WARNING: No documents found!")
-        print("   Add PDF, DOCX, TXT, or MD files to:")
-        print(f"   - {teacher_folder}/")
-        print(f"   - {student_folder}/")
-        print()
-        input("Press Enter to continue...")
+    await store_document(saved_path, doc_id, access_level, allowed_ids, class_group)
+
+    return {"document_id": doc_id, "message": f"Document uploaded with {access_level} access"}
 
 
-def main():
-    """Main function"""
-    print_header()
-    check_setup()
-    index_documents()
-    query_loop()
+@app.post("/query")
+async def query(request: QueryRequest):
+    token_payload = decode_token(request.user_token)
+    if not token_payload:
+        raise HTTPException(401, "Invalid or expired token")
+
+    user_id = token_payload.get("sub")
+    # In real system, get actual user classes from DB; here use empty list for demo
+    user_classes = []
+
+    answer, sources = await query_rag(request.query, request.user_token, user_id, user_classes)
+    return {"answer": answer, "sources": sources}
+
+
+@app.get("/")
+async def root():
+    return {"message": "RAG RBAC app is running. Visit /docs to interact."}
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n👋 Interrupted. Goodbye!")
-        print("=" * 70 + "\n")
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-
-        traceback.print_exc()
+    uvicorn.run("main:app", host="127.0.0.1", port=8000)

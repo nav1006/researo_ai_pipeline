@@ -7,3 +7,13 @@ python-doc
 pypdf
 sentence-transformers
 ollama
+fastapi
+uvicorn[standard]
+pydantic
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+PyPDF2
+python-docx
+sqlalchemy
+aiosqlite
